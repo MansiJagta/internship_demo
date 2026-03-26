@@ -323,24 +323,45 @@
 
 
 
+
 import os
+import bcrypt
 import jwt
+import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional, List
-from fastapi import Depends, FastAPI, HTTPException, status, Query
+from fastapi import Depends, FastAPI, HTTPException, status, Query, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from passlib.context import CryptContext
 from sentence_transformers import SentenceTransformer
 from bson import ObjectId
+from passlib.context import CryptContext
+
+# --- Python 3.13 bcrypt monkey patch for passlib ---
+if not hasattr(bcrypt, "__about__"):
+    bcrypt.__about__ = type("about", (), {"__version__": bcrypt.__version__})
+
+pwd_context = CryptContext(schemes=["pbkdf2_sha256"], deprecated="auto")
 
 from database import lifespan, get_vehicle_collection, get_user_collection, get_negotiations_collection
-from models import SignupRequest, LoginRequest, AuthResponse, UserPublic, UserRole, VehicleSearchResponse
+from models import (
+    SignupRequest, LoginRequest, AuthResponse, UserPublic,
+    VehicleSearchResponse, NegotiationRequest, NegotiationChatResponse,
+    ChatMessage, Offer, SellerListing, ListingRequest
+)
+from negotiator import negotiator_app
+from langchain_core.messages import HumanMessage, AIMessage
 
 app = FastAPI(title="AutoVibe API", lifespan=lifespan)
 model = SentenceTransformer('all-MiniLM-L6-v2')
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 security = HTTPBearer()
+
+# --- Password Helpers using passlib PBKDF2 ---
+def hash_password(plain: str) -> str:
+    return pwd_context.hash(plain)
+
+def verify_password(plain: str, hashed: str) -> bool:
+    return pwd_context.verify(plain, hashed)
 
 # Auth Settings
 JWT_SECRET = os.getenv("JWT_SECRET", "your-secret-key-here")
@@ -370,20 +391,53 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
         user_id = payload.get("sub")
         if not user_id:
             raise HTTPException(status_code=401, detail="Invalid token")
-        
         user_col = get_user_collection()
         user = await user_col.find_one({"_id": ObjectId(user_id)})
         if not user:
             raise HTTPException(status_code=401, detail="User not found")
+        user["id"] = str(user["_id"])
         return user
     except Exception:
         raise HTTPException(status_code=401, detail="Could not validate credentials")
+
+# ─────────────────────────────────────────────
+# Helper: serialize a vehicle doc from MongoDB
+# ─────────────────────────────────────────────
+def _serialize_vehicle(v: dict) -> dict:
+    v["id"] = str(v.pop("_id"))
+    # Ensure images list is populated
+    if not v.get("images"):
+        v["images"] = [v.get("image_url", "")]
+    # Map is_suspicious → is_anomaly for the frontend
+    if "is_anomaly" not in v:
+        is_sus = v.get("is_suspicious", False)
+        v["is_anomaly"] = is_sus
+        if is_sus and "anomaly_severity" not in v:
+            v["anomaly_severity"] = "medium"
+    # Defaults for optional fields
+    for field, default in [
+        ("fuel_type", "Gasoline"), ("transmission", "Automatic"),
+        ("engine", ""), ("horsepower", 200), ("drivetrain", "FWD"),
+        ("exterior_color", ""), ("interior_color", ""),
+        ("mpg_city", 20), ("mpg_highway", 28),
+        ("seller", "AutoVibe Certified"), ("location", "United States"),
+        ("listed_date", ""), ("vin", ""),
+    ]:
+        if field not in v:
+            v[field] = default
+    return v
 
 # --- ROUTES ---
 
 @app.get("/")
 async def root():
     return {"message": "AutoVibe API is live!"}
+
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
+
+# ── Auth ──────────────────────────────────────
 
 @app.post("/auth/signup", response_model=AuthResponse)
 async def signup(payload: SignupRequest):
@@ -395,39 +449,95 @@ async def signup(payload: SignupRequest):
     user_doc = {
         "name": payload.name,
         "email": payload.email.lower(),
-        "password_hash": pwd_context.hash(payload.password),
+        "password_hash": hash_password(payload.password),
         "role": payload.role,
         "created_at": datetime.utcnow()
     }
     result = await user_col.insert_one(user_doc)
     user_id = str(result.inserted_id)
-    
+
     token = create_access_token(user_id, payload.role, payload.email)
-    return AuthResponse(access_token=token, user=UserPublic(id=user_id, **user_doc))
+    return AuthResponse(
+        access_token=token,
+        user=UserPublic(id=user_id, name=payload.name, email=payload.email, role=payload.role)
+    )
 
 @app.post("/auth/login", response_model=AuthResponse)
 async def login(payload: LoginRequest):
     user_col = get_user_collection()
     user = await user_col.find_one({"email": payload.email.lower()})
-    
-    if not user or not pwd_context.verify(payload.password, user["password_hash"]):
+
+    if not user or not verify_password(payload.password, user["password_hash"]):
         raise HTTPException(status_code=401, detail="Invalid email or password")
-    
+
     user_id = str(user["_id"])
     token = create_access_token(user_id, user["role"], user["email"])
-    return AuthResponse(access_token=token, user=UserPublic(id=user_id, **user))
+    return AuthResponse(
+        access_token=token,
+        user=UserPublic(id=user_id, name=user["name"], email=user["email"], role=user["role"])
+    )
+
+@app.get("/auth/me", response_model=UserPublic)
+async def me(user: dict = Depends(get_current_user)):
+    return UserPublic(id=user["id"], name=user["name"], email=user["email"], role=user["role"])
+
+# ── Vehicles ──────────────────────────────────
 
 @app.get("/vehicles")
-async def list_vehicles(make: Optional[str] = None, page: int = 1):
+async def list_vehicles(
+    make: Optional[str] = None,
+    min_price: Optional[float] = None,
+    max_price: Optional[float] = None,
+    min_year: Optional[int] = None,
+    max_year: Optional[int] = None,
+    max_mileage: Optional[int] = None,
+    page: int = 1,
+    limit: int = 12,
+):
     col = get_vehicle_collection()
-    query = {"make": {"$regex": make, "$options": "i"}} if make else {}
-    cursor = col.find(query, {"min_acceptable_price": 0, "embedding": 0}).sort("year", -1).skip((page-1)*12).limit(12)
-    vehicles = await cursor.to_list(length=12)
-    for v in vehicles:
-        v["id"] = str(v["_id"])
-    return vehicles
+    query: dict = {}
+    if make:
+        query["make"] = {"$regex": make, "$options": "i"}
+    if min_price is not None or max_price is not None:
+        query["price"] = {}
+        if min_price is not None:
+            query["price"]["$gte"] = min_price
+        if max_price is not None:
+            query["price"]["$lte"] = max_price
+    if min_year is not None or max_year is not None:
+        query["year"] = {}
+        if min_year is not None:
+            query["year"]["$gte"] = min_year
+        if max_year is not None:
+            query["year"]["$lte"] = max_year
+    if max_mileage is not None:
+        query["mileage"] = {"$lte": max_mileage}
 
-@app.post("/search/semantic", response_model=List[VehicleSearchResponse])
+    cursor = (
+        col.find(query, {"min_acceptable_price": 0, "embedding": 0})
+        .sort("year", -1)
+        .skip((page - 1) * limit)
+        .limit(limit)
+    )
+    vehicles = await cursor.to_list(length=limit)
+    return [_serialize_vehicle(v) for v in vehicles]
+
+@app.get("/vehicles/{vehicle_id}")
+async def get_vehicle(vehicle_id: str):
+    col = get_vehicle_collection()
+    try:
+        obj_id = ObjectId(vehicle_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid vehicle ID")
+
+    v = await col.find_one({"_id": obj_id}, {"min_acceptable_price": 0, "embedding": 0})
+    if not v:
+        raise HTTPException(status_code=404, detail="Vehicle not found")
+    return _serialize_vehicle(v)
+
+# ── Semantic Search ────────────────────────────
+
+@app.post("/search/semantic")
 async def semantic_search(query: str):
     col = get_vehicle_collection()
     vector = model.encode(query, normalize_embeddings=True).tolist()
@@ -439,42 +549,160 @@ async def semantic_search(query: str):
             "numCandidates": 50,
             "limit": 6
         }},
-        {"$project": {"embedding": 0, "min_acceptable_price": 0, "score": {"$meta": "vectorSearchScore"}}}
+        {"$project": {"embedding": 0, "min_acceptable_price": 0}}
     ]
-    results = await col.aggregate(pipeline).to_list(length=6)
-    return [VehicleSearchResponse(id=str(r["_id"]), **r) for r in results]
+    try:
+        results = await col.aggregate(pipeline).to_list(length=6)
+        return [_serialize_vehicle(r) for r in results]
+    except Exception:
+        # Fallback: keyword search if Atlas vector index not set up
+        regex = {"$regex": query, "$options": "i"}
+        cursor = col.find(
+            {"$or": [{"make": regex}, {"model": regex}, {"description": regex}]},
+            {"embedding": 0, "min_acceptable_price": 0}
+        ).limit(6)
+        results = await cursor.to_list(length=6)
+        return [_serialize_vehicle(r) for r in results]
 
-@app.post("/negotiate")
-async def negotiate(vehicle_id: str, offer: float, user: dict = Depends(get_current_user)):
-    vehicle_col = get_vehicle_collection()
+# ── Negotiate ──────────────────────────────────
+
+@app.post("/negotiate", response_model=NegotiationChatResponse)
+async def negotiate(
+    payload: NegotiationRequest,
+    user: dict = Depends(get_current_user)
+):
+    # Load previous history from DB
     neg_col = get_negotiations_collection()
+    existing_neg = await neg_col.find_one({
+        "vehicle_id": payload.vehicle_id,
+        "buyer_id": ObjectId(user["id"])
+    })
     
-    vehicle = await vehicle_col.find_one({"_id": ObjectId(vehicle_id)})
-    if not vehicle:
-        raise HTTPException(status_code=404, detail="Vehicle not found")
-
-    # Agentic Logic: Check hidden minimum price
-    min_price = vehicle.get("min_acceptable_price", vehicle["price"] * 0.9)
+    history = []
+    if existing_neg and "messages" in existing_neg:
+        for m in existing_neg["messages"]:
+            if m["sender"] == "human":
+                history.append(HumanMessage(content=m["message"]))
+            else:
+                history.append(AIMessage(content=m["message"]))
     
-    if offer >= vehicle["price"]:
-        response = "That is a generous offer! We accept immediately."
-        status = "accepted"
-    elif offer >= min_price:
-        response = f"Your offer of ${offer} is fair. We have a deal!"
-        status = "accepted"
-    else:
-        response = f"I'm sorry, ${offer} is below the seller's minimum. Can you go higher?"
-        status = "countered"
-
-    # Persist the negotiation in Atlas
-    negotiation_entry = {
-        "buyer_id": user["_id"],
-        "vehicle_id": vehicle_id,
-        "offer_price": offer,
-        "assistant_response": response,
-        "status": status,
-        "timestamp": datetime.utcnow()
+    # Initialize state for LangGraph
+    # We append the NEW message to the history
+    initial_state = {
+        "messages": history + [HumanMessage(content=payload.message)],
+        "vehicle_id": payload.vehicle_id,
+        "buyer_id": user["id"],
+        "offer_amount": payload.offer_price,
+        "decision": "PENDING"
     }
-    await neg_col.insert_one(negotiation_entry)
+    
+    # Run the graph
+    try:
+        final_state = await negotiator_app.ainvoke(initial_state)
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Negotiation engine error: {str(e)}")
+    
+    last_message = final_state["messages"][-1]
+    reply_text = last_message.content
 
-    return {"message": response, "status": status}
+    reply = ChatMessage(
+        id=f"ai-{uuid.uuid4().hex[:8]}",
+        sender="ai",
+        message=reply_text,
+        timestamp=datetime.utcnow().isoformat(),
+    )
+    return NegotiationChatResponse(success=True, reply=reply)
+
+# ── Offers (buyer) ────────────────────────────
+
+@app.get("/offers")
+async def get_my_offers(user: dict = Depends(get_current_user)):
+    neg_col = get_negotiations_collection()
+    cursor = neg_col.find(
+        {"buyer_id": ObjectId(user["id"])},
+    ).sort("timestamp", -1).limit(20)
+    docs = await cursor.to_list(length=20)
+
+    offers = []
+    for doc in docs:
+        offers.append({
+            "id": str(doc["_id"]),
+            "vehicle_id": doc.get("vehicle_id", ""),
+            "vehicle_title": doc.get("vehicle_title", "Unknown Vehicle"),
+            "vehicle_image": doc.get("vehicle_image", ""),
+            "offer_price": doc.get("offer_price", 0),
+            "asking_price": doc.get("asking_price", 0),
+            "status": doc.get("status", "pending"),
+            "counter_price": doc.get("counter_price"),
+            "created_at": doc.get("timestamp", datetime.utcnow()).isoformat() if hasattr(doc.get("timestamp"), "isoformat") else str(doc.get("timestamp", "")),
+            "updated_at": doc.get("updated_at", datetime.utcnow()).isoformat() if hasattr(doc.get("updated_at"), "isoformat") else str(doc.get("updated_at", "")),
+        })
+    return offers
+
+# ── Seller Listings ───────────────────────────
+
+@app.get("/seller/listings")
+async def get_my_listings(user: dict = Depends(get_current_user)):
+    if user.get("role") not in ("seller", "admin"):
+        raise HTTPException(status_code=403, detail="Only sellers can access listings")
+
+    col = get_vehicle_collection()
+    cursor = col.find(
+        {"seller_id": user["id"]},
+        {"embedding": 0}
+    ).sort("created_at", -1).limit(50)
+    docs = await cursor.to_list(length=50)
+
+    # Count negotiations per vehicle
+    neg_col = get_negotiations_collection()
+    listings = []
+    for doc in docs:
+        vid = str(doc["_id"])
+        chat_count = await neg_col.count_documents({"vehicle_id": vid})
+        listings.append({
+            "listing_id": vid,
+            "vehicle": f"{doc['year']} {doc['make']} {doc['model']}",
+            "ai_chat_count": chat_count,
+            "asking_price": doc["price"],
+        })
+    return listings
+
+@app.post("/seller/listings")
+async def create_listing(
+    payload: ListingRequest,
+    user: dict = Depends(get_current_user)
+):
+    if user.get("role") not in ("seller", "admin"):
+        raise HTTPException(status_code=403, detail="Only sellers can create listings")
+
+    col = get_vehicle_collection()
+    now = datetime.utcnow()
+    doc = {
+        "make": payload.make,
+        "model": payload.model,
+        "year": payload.year,
+        "price": payload.price,
+        "mileage": payload.mileage,
+        "description": payload.description,
+        "fuel_type": payload.fuel_type,
+        "transmission": payload.transmission,
+        "exterior_color": payload.exterior_color,
+        "interior_color": payload.interior_color,
+        "vin": payload.vin,
+        "location": payload.location,
+        "min_acceptable_price": payload.hidden_min_price,
+        "image_url": f"https://picsum.photos/seed/{payload.make.lower()}-{payload.year}/900/600",
+        "images": [f"https://picsum.photos/seed/{payload.make.lower()}-{payload.year}/900/600"],
+        "seller": user["name"],
+        "seller_id": user["id"],
+        "listed_date": now.strftime("%Y-%m-%d"),
+        "is_suspicious": False,
+        "is_anomaly": False,
+        "embedding": None,
+        "created_at": now,
+    }
+    result = await col.insert_one(doc)
+    return {"listing_id": str(result.inserted_id), "message": "Listing created successfully"}
+

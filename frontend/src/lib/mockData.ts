@@ -5,7 +5,7 @@ export interface Vehicle {
   year: number;
   price: number;
   mileage: number;
-  image: string;
+  image_url: string;
   images: string[];
   fuel_type: string;
   transmission: string;
@@ -60,7 +60,7 @@ const carImages = [
 export const vehicles: Vehicle[] = [
   {
     id: "1", make: "Tesla", model: "Model S Plaid", year: 2024, price: 89990, mileage: 1200,
-    image: carImages[0], images: [carImages[0], carImages[1], carImages[2]],
+    image_url: carImages[0], images: [carImages[0], carImages[1], carImages[2]],
     fuel_type: "Electric", transmission: "Single-Speed", engine: "Tri Motor AWD", horsepower: 1020,
     drivetrain: "AWD", exterior_color: "Pearl White", interior_color: "Black",
     mpg_city: 124, mpg_highway: 115, description: "Pristine condition with Full Self-Driving capability.",

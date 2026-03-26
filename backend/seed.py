@@ -655,13 +655,6 @@
 
 
 import bcrypt
-# This specific patch fixes the '72 bytes' and 'AttributeError' in Python 3.13
-if not hasattr(bcrypt, "__about__"):
-    class About:
-        __version__ = bcrypt.__version__
-    bcrypt.__about__ = About
-
-
 import asyncio
 import os
 import random
@@ -671,7 +664,6 @@ from datetime import datetime
 from dotenv import load_dotenv
 from faker import Faker
 from motor.motor_asyncio import AsyncIOMotorClient
-from passlib.context import CryptContext
 from sentence_transformers import SentenceTransformer
 from bson import ObjectId
 
@@ -679,15 +671,13 @@ from bson import ObjectId
 from database import db_helper, get_vehicle_collection, get_user_collection, get_negotiations_collection
 from models import Vehicle
 
-import bcrypt
-# Fix for passlib/bcrypt compatibility
-if not hasattr(bcrypt, "__about__"):
-    bcrypt.__about__ = type('about', (object,), {'__version__': bcrypt.__version__})
-
 # Configuration
 TOTAL_VEHICLES = 50
 EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+def hash_password(plain: str) -> str:
+    """Hash a password using bcrypt directly (avoids passlib/Python 3.13 issues)."""
+    return bcrypt.hashpw(plain[:72].encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
 
 MAKE_MODEL_MAP = {
     "Toyota": ["Camry", "Corolla", "RAV4", "Highlander"],
@@ -700,7 +690,31 @@ MAKE_MODEL_MAP = {
     "Kia": ["K5", "Sportage", "Sorento", "Telluride"],
 }
 
-def generate_vehicle(fake: Faker, idx: int) -> Vehicle:
+FUEL_TYPES = ["Gasoline", "Electric", "Hybrid", "Diesel"]
+TRANSMISSIONS = ["Automatic", "Manual", "CVT", "DCT", "Single-Speed"]
+DRIVETRAINS = ["FWD", "RWD", "AWD", "4WD"]
+COLORS_EXT = ["Pearl White", "Midnight Black", "Deep Blue", "Racing Red", "Forest Green",
+              "Silver", "Champagne Gold", "Slate Gray", "Navy Blue", "Burnt Orange"]
+COLORS_INT = ["Black", "Cognac", "Gray", "Cream", "Red Pepper", "Brown", "Beige", "White"]
+LOCATIONS = ["San Francisco, CA", "Los Angeles, CA", "New York, NY", "Miami, FL",
+             "Chicago, IL", "Seattle, WA", "Austin, TX", "Denver, CO", "Phoenix, AZ", "Detroit, MI"]
+
+MAKE_SPECS = {
+    "Toyota":  {"fuel": ["Gasoline", "Hybrid"], "hp_range": (170, 302), "mpg_city": (28, 40), "mpg_hwy": (35, 50)},
+    "Honda":   {"fuel": ["Gasoline", "Hybrid"], "hp_range": (158, 315), "mpg_city": (28, 40), "mpg_hwy": (34, 48)},
+    "Ford":    {"fuel": ["Gasoline", "Electric"], "hp_range": (180, 486), "mpg_city": (15, 30), "mpg_hwy": (22, 38)},
+    "BMW":     {"fuel": ["Gasoline", "Hybrid"], "hp_range": (255, 617), "mpg_city": (16, 28), "mpg_hwy": (24, 36)},
+    "Audi":    {"fuel": ["Gasoline", "Electric"], "hp_range": (201, 637), "mpg_city": (19, 79), "mpg_hwy": (27, 82)},
+    "Tesla":   {"fuel": ["Electric"],             "hp_range": (283, 1020),"mpg_city": (100, 135),"mpg_hwy": (100, 130)},
+    "Hyundai": {"fuel": ["Gasoline", "Electric", "Hybrid"], "hp_range": (147, 483), "mpg_city": (25, 115), "mpg_hwy": (32, 120)},
+    "Kia":     {"fuel": ["Gasoline", "Electric", "Hybrid"], "hp_range": (147, 320), "mpg_city": (26, 120), "mpg_hwy": (33, 115)},
+}
+
+def generate_vin(fake: "Faker", make: str, idx: int) -> str:
+    prefix = make[:2].upper()
+    return f"{prefix}A{fake.bothify('??####??###')}{idx:04d}"[-17:]
+
+def generate_vehicle(fake: "Faker", idx: int) -> "Vehicle":
     make = random.choice(list(MAKE_MODEL_MAP.keys()))
     model = random.choice(MAKE_MODEL_MAP[make])
     year = random.randint(2014, 2025)
@@ -725,7 +739,30 @@ def generate_vehicle(fake: Faker, idx: int) -> Vehicle:
         f"Single-owner history, clean records, and recently serviced."
     )
 
-    image_url = f"https://picsum.photos/seed/autovibe-{idx}/900/600"
+    # Rich spec fields
+    specs = MAKE_SPECS.get(make, {"fuel": ["Gasoline"], "hp_range": (150, 300), "mpg_city": (18, 28), "mpg_hwy": (25, 35)})
+    fuel_type = random.choice(specs["fuel"])
+    transmission = "Single-Speed" if fuel_type == "Electric" else random.choice(["Automatic", "DCT", "Manual", "CVT"])
+    horsepower = random.randint(*specs["hp_range"])
+    drivetrain = random.choice(DRIVETRAINS)
+    mpg_city = random.randint(*specs["mpg_city"])
+    mpg_highway = random.randint(*specs["mpg_hwy"])
+    ext_color = random.choice(COLORS_EXT)
+    int_color = random.choice(COLORS_INT)
+    location = random.choice(LOCATIONS)
+    listed_date = fake.date_between(start_date="-60d", end_date="today").strftime("%Y-%m-%d")
+    vin = generate_vin(fake, make, idx)
+    engine_size = round(random.uniform(1.5, 5.0), 1)
+    engine = f"Electric Motor" if fuel_type == "Electric" else f"{engine_size}L {random.choice(['I4','V6','V8','I6','Flat-6'])}"
+    seller = random.choice(["AutoVibe Certified", "Private Seller", f"{make} Dealer", "Exotic Motors"])
+
+    # Generate multiple image URLs (using picsum seeds for variety)
+    base_img = f"https://picsum.photos/seed/autovibe-{idx}/900/600"
+    images = [
+        f"https://picsum.photos/seed/autovibe-{idx}/900/600",
+        f"https://picsum.photos/seed/autovibe-{idx}-2/900/600",
+        f"https://picsum.photos/seed/autovibe-{idx}-3/900/600",
+    ]
 
     return Vehicle(
         make=make,
@@ -734,7 +771,21 @@ def generate_vehicle(fake: Faker, idx: int) -> Vehicle:
         price=price,
         mileage=mileage,
         description=description,
-        image_url=image_url,
+        image_url=base_img,
+        images=images,
+        fuel_type=fuel_type,
+        transmission=transmission,
+        engine=engine,
+        horsepower=horsepower,
+        drivetrain=drivetrain,
+        exterior_color=ext_color,
+        interior_color=int_color,
+        mpg_city=mpg_city,
+        mpg_highway=mpg_highway,
+        seller=seller,
+        location=location,
+        listed_date=listed_date,
+        vin=vin,
         min_acceptable_price=min_acceptable_price,
     )
 
@@ -783,9 +834,9 @@ async def seed_users() -> dict:
     print("✓ Cleared users collection")
 
     users_data = [
-        {"name": "Mansi Jagtap", "email": "mansi@example.com", "password": pwd_context.hash("password123"), "role": "buyer", "created_at": datetime.utcnow()},
-        {"name": "Admin User", "email": "admin@example.com", "password": pwd_context.hash("Admin@123"), "role": "admin", "created_at": datetime.utcnow()},
-        {"name": "Seller User", "email": "seller@example.com", "password": pwd_context.hash("Seller@123"), "role": "seller", "created_at": datetime.utcnow()},
+        {"name": "Mansi Jagtap", "email": "mansi@example.com", "password": hash_password("password123"), "role": "buyer", "created_at": datetime.utcnow()},
+        {"name": "Admin User", "email": "admin@example.com", "password": hash_password("Admin@123"), "role": "admin", "created_at": datetime.utcnow()},
+        {"name": "Seller User", "email": "seller@example.com", "password": hash_password("Seller@123"), "role": "seller", "created_at": datetime.utcnow()},
     ]
 
     result = await users_col.insert_many(users_data)

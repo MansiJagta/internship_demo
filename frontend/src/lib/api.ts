@@ -89,7 +89,7 @@ export async function fetchVehicle(id: string): Promise<Vehicle | undefined> {
 
 export async function semanticSearch(query: string): Promise<Vehicle[]> {
   try {
-    const { data } = await api.post("/search/semantic", { query });
+    const { data } = await api.post("/search/semantic", null, { params: { query } });
     return data;
   } catch {
     // Simulate semantic search with keyword matching
@@ -151,4 +151,25 @@ export async function fetchMyListings(): Promise<SellerListing[]> {
       },
     ];
   }
+}
+
+export interface CreateListingPayload {
+  make: string;
+  model: string;
+  year: number;
+  mileage: number;
+  fuel_type: string;
+  transmission: string;
+  exterior_color: string;
+  interior_color: string;
+  vin: string;
+  location: string;
+  description: string;
+  price: number;
+  hidden_min_price: number;
+}
+
+export async function createListing(body: CreateListingPayload): Promise<{ listing_id: string; message: string }> {
+  const { data } = await api.post("/seller/listings", body);
+  return data;
 }

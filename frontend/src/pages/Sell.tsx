@@ -5,6 +5,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { toast } from "sonner";
+import { createListing } from "@/lib/api";
 
 const steps = [
   { label: "Vehicle Info", icon: Car },
@@ -15,6 +16,7 @@ const steps = [
 
 export default function Sell() {
   const [step, setStep] = useState(0);
+  const [isSubmitting, setIsSubmitting] = useState(false);
   const [form, setForm] = useState({
     make: "", model: "", year: "", mileage: "", fuel_type: "", transmission: "",
     exterior_color: "", interior_color: "", description: "", price: "", hidden_min_price: "", vin: "", location: "",
@@ -22,10 +24,39 @@ export default function Sell() {
 
   const update = (field: string, value: string) => setForm(prev => ({ ...prev, [field]: value }));
 
-  const handleSubmit = () => {
-    toast.success("Listing submitted for review!");
-    setStep(0);
-    setForm({ make: "", model: "", year: "", mileage: "", fuel_type: "", transmission: "", exterior_color: "", interior_color: "", description: "", price: "", hidden_min_price: "", vin: "", location: "" });
+  const handleSubmit = async () => {
+    setIsSubmitting(true);
+    try {
+      await createListing({
+        make: form.make,
+        model: form.model,
+        year: parseInt(form.year) || 2024,
+        mileage: parseInt(form.mileage) || 0,
+        fuel_type: form.fuel_type || "Gasoline",
+        transmission: form.transmission || "Automatic",
+        exterior_color: form.exterior_color,
+        interior_color: form.interior_color,
+        vin: form.vin,
+        location: form.location,
+        description: form.description,
+        price: parseFloat(form.price) || 0,
+        hidden_min_price: parseFloat(form.hidden_min_price) || parseFloat(form.price) * 0.9 || 0,
+      });
+      toast.success("Listing submitted successfully! It will appear in My Listings.");
+      setStep(0);
+      setForm({ make: "", model: "", year: "", mileage: "", fuel_type: "", transmission: "", exterior_color: "", interior_color: "", description: "", price: "", hidden_min_price: "", vin: "", location: "" });
+    } catch (err: any) {
+      const detail = err?.response?.data?.detail;
+      if (detail?.includes("seller")) {
+        toast.error("Only seller accounts can create listings. Please log in as a seller.");
+      } else if (err?.response?.status === 401) {
+        toast.error("Please log in to create a listing.");
+      } else {
+        toast.error("Failed to submit listing. Please try again.");
+      }
+    } finally {
+      setIsSubmitting(false);
+    }
   };
 
   return (
@@ -144,8 +175,8 @@ export default function Sell() {
             Next <ChevronRight className="w-4 h-4 ml-1" />
           </Button>
         ) : (
-          <Button onClick={handleSubmit}>
-            <Check className="w-4 h-4 mr-1" /> Submit Listing
+          <Button onClick={handleSubmit} disabled={isSubmitting}>
+            {isSubmitting ? "Submitting..." : <><Check className="w-4 h-4 mr-1" /> Submit Listing</>}
           </Button>
         )}
       </div>

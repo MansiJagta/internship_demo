@@ -99,15 +99,8 @@ async def lifespan(app: FastAPI):
 def get_vehicle_collection():
     return db_helper.db.get_collection("vehicles")
 
-def get_negotiation_collection():
-    return db_helper.db.get_collection("negotiations")
-
-def get_vehicle_collection():
-    return db_helper.db.get_collection("vehicles")
-
-# Add these two new ones below:
 def get_user_collection():
     return db_helper.db.get_collection("users")
 
 def get_negotiations_collection():
-    return db_helper.db.get_collection("negotiations")
+    return db_helper.db.get_collection("negotiations")
